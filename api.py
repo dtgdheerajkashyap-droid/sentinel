@@ -196,6 +196,8 @@ def mark_scan_safe(scan_id: int):
 @app.post("/api/scans/{scan_id}/quarantine")
 def quarantine_scan(scan_id: int):
     return update_action_status(scan_id, "quarantined")
+
+
 @app.get("/api/top-risky-senders")
 def top_risky_senders():
     conn = sqlite3.connect(DB_PATH)

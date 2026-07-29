@@ -62,6 +62,70 @@ SUSPICIOUS_TLDS = [
 ]
 
 
+# Bare brand names (no TLD) used for typosquat detection via edit distance.
+# Covers major global brands plus banks present in TRUSTED_DOMAINS.
+BRAND_NAMES = [
+    "google",
+    "gmail",
+    "paypal",
+    "amazon",
+    "microsoft",
+    "canarabank",
+]
+
+# Edit distance 1..TYPOSQUAT_MAX_DISTANCE from a brand name counts as a
+# possible typosquat (distance 0 means the brand itself, handled by the
+# trusted-domain check instead).
+TYPOSQUAT_MAX_DISTANCE = 2
+
+# Sentinel value for "no meaningful brand distance" (empty/very short domain).
+BRAND_DISTANCE_NONE = 99
+
+URGENCY_KEYWORDS = {
+    "urgent": 10,
+    "immediately": 10,
+    "verify": 10,
+    "account suspended": 15,
+    "suspended": 10,
+    "click now": 10,
+    "act now": 10,
+    "limited time": 10,
+    "password": 5,
+    "otp": 5,
+}
+
+
+# --------------------------------------------------
+# EDIT DISTANCE (python-Levenshtein with pure fallback)
+# --------------------------------------------------
+
+try:
+    import Levenshtein
+
+    def edit_distance(a, b):
+        return Levenshtein.distance(a, b)
+
+except ImportError:
+
+    def edit_distance(a, b):
+        if len(a) < len(b):
+            a, b = b, a
+
+        previous = list(range(len(b) + 1))
+
+        for i, char_a in enumerate(a):
+            current = [i + 1]
+            for j, char_b in enumerate(b):
+                current.append(min(
+                    previous[j + 1] + 1,
+                    current[j] + 1,
+                    previous[j] + (char_a != char_b),
+                ))
+            previous = current
+
+        return previous[-1]
+
+
 # --------------------------------------------------
 # DATABASE SETUP
 # --------------------------------------------------
@@ -257,6 +321,11 @@ def extract_urls(text):
     return cleaned_urls
 
 
+def num_urls_in_body(body):
+    """Count of distinct non-ignored URLs found in the email body."""
+    return len(extract_urls(body))
+
+
 # --------------------------------------------------
 # DOMAIN HELPERS
 # --------------------------------------------------
@@ -281,19 +350,59 @@ def get_domain_from_email(sender):
 
 
 # --------------------------------------------------
-# URL RISK ANALYSIS
+# TYPOSQUAT DETECTION
+# --------------------------------------------------
+
+def brand_edit_distance(domain_name):
+    """Minimum edit distance from a bare domain name to any known brand.
+
+    Returns BRAND_DISTANCE_NONE when the domain is empty or too short to
+    compare meaningfully.
+    """
+    domain_name = (domain_name or "").lower()
+
+    if len(domain_name) < 4:
+        return BRAND_DISTANCE_NONE
+
+    return min(edit_distance(domain_name, brand) for brand in BRAND_NAMES)
+
+
+def is_typosquat(domain_name):
+    """True when the domain is close to a brand name but not exactly it."""
+    distance = brand_edit_distance(domain_name)
+    return 1 <= distance <= TYPOSQUAT_MAX_DISTANCE
+
+
+# --------------------------------------------------
+# URL FEATURE EXTRACTION
 # --------------------------------------------------
 
 def analyze_url(url):
+    """Extract raw features from a URL.
+
+    Returns (features, reasons). Features are typed raw values
+    (booleans/counts), not point scores; scoring happens in the risk
+    engine (ML model or heuristic fallback).
+    """
     url = clean_url(url)
 
+    features = {
+        "ignored": False,
+        "is_trusted": False,
+        "suspicious_tld": False,
+        "has_digit_in_domain": False,
+        "domain_length": 0,
+        "brand_distance": BRAND_DISTANCE_NONE,
+        "is_typosquat": False,
+        "num_redirects": 0,
+    }
+
     if should_ignore_url(url):
-        return 0, []
+        features["ignored"] = True
+        return features, []
 
     parsed = urlparse(url)
-    hostname = parsed.hostname or ""
-
-    hostname = hostname.lower()
+    hostname = (parsed.hostname or "").lower()
 
     if hostname.startswith("www."):
         hostname = hostname[4:]
@@ -304,23 +413,31 @@ def analyze_url(url):
     suffix = ext.suffix.lower()
     full_domain = f"{domain}.{suffix}" if suffix else domain
 
-    raw_score = 0
-    reasons = []
+    features["domain_length"] = len(domain)
+    features["brand_distance"] = brand_edit_distance(domain)
 
     if is_trusted_domain(full_domain):
-        return 0, []
+        features["is_trusted"] = True
+        return features, []
+
+    reasons = []
 
     if suffix in SUSPICIOUS_TLDS:
-        raw_score += 40
+        features["suspicious_tld"] = True
         reasons.append(f"Suspicious URL TLD: .{suffix}")
 
     if any(char.isdigit() for char in domain):
-        raw_score += 30
+        features["has_digit_in_domain"] = True
         reasons.append("URL domain contains numbers")
 
     if len(domain) > 20:
-        raw_score += 20
         reasons.append("Unusually long URL domain")
+
+    if is_typosquat(domain):
+        features["is_typosquat"] = True
+        reasons.append(
+            f"URL domain '{domain}' looks like a typosquat of a known brand"
+        )
 
     query_params = parse_qs(parsed.query)
 
@@ -337,74 +454,198 @@ def analyze_url(url):
             redirected_url = unquote(query_params[key][0])
 
             if redirected_url.startswith("http"):
-                redirect_score, redirect_reasons = analyze_url(redirected_url)
-                raw_score += redirect_score
+                redirect_features, redirect_reasons = analyze_url(
+                    redirected_url
+                )
+                features["num_redirects"] += 1 + redirect_features[
+                    "num_redirects"
+                ]
+                features["suspicious_tld"] |= redirect_features[
+                    "suspicious_tld"
+                ]
+                features["has_digit_in_domain"] |= redirect_features[
+                    "has_digit_in_domain"
+                ]
+                features["is_typosquat"] |= redirect_features["is_typosquat"]
+                features["brand_distance"] = min(
+                    features["brand_distance"],
+                    redirect_features["brand_distance"],
+                )
                 reasons.extend(redirect_reasons)
 
-    return raw_score, reasons
+    return features, reasons
+
+
+def url_heuristic_score(features):
+    """Legacy additive score for a single URL's features (fallback path)."""
+    if features["ignored"] or features["is_trusted"]:
+        return 0
+
+    score = 0
+
+    if features["suspicious_tld"]:
+        score += 40
+
+    if features["has_digit_in_domain"]:
+        score += 30
+
+    if features["domain_length"] > 20:
+        score += 20
+
+    if features["is_typosquat"]:
+        score += 40
+
+    return score
 
 
 # --------------------------------------------------
-# SENDER RISK ANALYSIS
+# SENDER FEATURE EXTRACTION
 # --------------------------------------------------
 
 def analyze_sender(sender):
+    """Extract raw features from the From address.
+
+    Returns (features, reasons) — raw typed values, no point scores.
+    """
     sender = sender.lower()
     sender_domain = get_domain_from_email(sender)
 
-    raw_score = 0
-    reasons = []
+    ext = tldextract.extract(sender_domain)
+    domain_name = ext.domain.lower()
+
+    features = {
+        "is_trusted": False,
+        "suspicious_tld": False,
+        "has_digit_in_domain": False,
+        "domain_length": len(sender_domain),
+        "brand_distance": brand_edit_distance(domain_name),
+        "is_typosquat": False,
+    }
 
     if sender_domain and is_trusted_domain(sender_domain):
-        return 0, []
+        features["is_trusted"] = True
+        return features, []
+
+    reasons = []
 
     for tld in SUSPICIOUS_TLDS:
         if sender_domain.endswith("." + tld):
-            raw_score += 40
+            features["suspicious_tld"] = True
             reasons.append(f"Suspicious sender TLD: .{tld}")
+            break
 
     if re.search(r"\d", sender_domain):
-        raw_score += 30
+        features["has_digit_in_domain"] = True
         reasons.append("Sender domain contains numbers")
 
     if len(sender_domain) > 35:
-        raw_score += 10
         reasons.append("Unusually long sender domain")
 
-    return raw_score, reasons
+    if is_typosquat(domain_name):
+        features["is_typosquat"] = True
+        reasons.append(
+            f"Sender domain '{sender_domain}' looks like a typosquat "
+            f"of a known brand"
+        )
+
+    return features, reasons
+
+
+def sender_heuristic_score(features):
+    """Legacy additive score for sender features (fallback path)."""
+    if features["is_trusted"]:
+        return 0
+
+    score = 0
+
+    if features["suspicious_tld"]:
+        score += 40
+
+    if features["has_digit_in_domain"]:
+        score += 30
+
+    if features["domain_length"] > 35:
+        score += 10
+
+    if features["is_typosquat"]:
+        score += 40
+
+    return score
 
 
 # --------------------------------------------------
-# URGENCY LANGUAGE ANALYSIS
+# EMAIL AUTHENTICATION (SPF / DKIM / DMARC)
+# --------------------------------------------------
+
+def analyze_authentication(headers):
+    """Parse Gmail's Authentication-Results header into pass/fail features.
+
+    `headers` is the list of {name, value} dicts from the Gmail API payload.
+    Each feature is True (pass), False (explicit non-pass), or None when the
+    mechanism is absent from the header.
+    """
+    features = {
+        "spf_pass": None,
+        "dkim_pass": None,
+        "dmarc_pass": None,
+    }
+
+    auth_results = ""
+
+    for header in headers or []:
+        if header.get("name", "").lower() == "authentication-results":
+            auth_results = header.get("value", "").lower()
+            break
+
+    if not auth_results:
+        return features, []
+
+    reasons = []
+
+    for mechanism in ("spf", "dkim", "dmarc"):
+        match = re.search(rf"\b{mechanism}=(\w+)", auth_results)
+
+        if match:
+            passed = match.group(1) == "pass"
+            features[f"{mechanism}_pass"] = passed
+
+            if not passed:
+                reasons.append(
+                    f"{mechanism.upper()} check failed ({match.group(1)})"
+                )
+
+    return features, reasons
+
+
+# --------------------------------------------------
+# URGENCY LANGUAGE FEATURE EXTRACTION
 # --------------------------------------------------
 
 def analyze_urgency(text):
+    """Extract urgency-language features from subject + body text.
+
+    Returns (features, reasons) — keyword hit counts, no point scores.
+    """
     text = text.lower()
 
-    risk_score = 0
-    reasons = []
+    matched_keywords = [word for word in URGENCY_KEYWORDS if word in text]
 
-    keywords = {
-        "urgent": 10,
-        "immediately": 10,
-        "verify": 10,
-        "account suspended": 15,
-        "suspended": 10,
-        "click now": 10,
-        "act now": 10,
-        "limited time": 10,
-        "password": 5,
-        "otp": 5,
+    features = {
+        "num_urgency_keywords": len(matched_keywords),
+        "matched_keywords": matched_keywords,
     }
 
-    for word, score in keywords.items():
-        if word in text:
-            risk_score += score
-            reasons.append(f"Contains '{word}'")
+    reasons = [f"Contains '{word}'" for word in matched_keywords]
 
-    risk_score = min(risk_score, 15)
+    return features, reasons
 
-    return risk_score, reasons
+
+def urgency_heuristic_score(features):
+    """Legacy capped additive score for urgency features (fallback path)."""
+    score = sum(
+        URGENCY_KEYWORDS[word] for word in features["matched_keywords"]
+    )
+    return min(score, 15)
 
 
 # --------------------------------------------------
@@ -594,19 +835,30 @@ def run_scanner():
         body = extract_body(msg["payload"])
         urls = extract_urls(body)
 
-        total_url_raw_score = 0
         all_reasons = []
+        url_features_list = []
 
         for url in urls:
-            score, reasons = analyze_url(url)
-            total_url_raw_score += score
+            url_features, reasons = analyze_url(url)
+            url_features_list.append(url_features)
             all_reasons.extend(reasons)
 
-        sender_raw_score, sender_reasons = analyze_sender(sender)
+        sender_features, sender_reasons = analyze_sender(sender)
         all_reasons.extend(sender_reasons)
 
-        urgency_risk, urgency_reasons = analyze_urgency(subject + " " + body)
+        auth_features, auth_reasons = analyze_authentication(headers)
+        all_reasons.extend(auth_reasons)
+
+        urgency_features, urgency_reasons = analyze_urgency(
+            subject + " " + body
+        )
         all_reasons.extend(urgency_reasons)
+
+        total_url_raw_score = sum(
+            url_heuristic_score(f) for f in url_features_list
+        )
+        sender_raw_score = sender_heuristic_score(sender_features)
+        urgency_risk = urgency_heuristic_score(urgency_features)
 
         final_score, risk_level, url_risk, sender_risk = calculate_risk(
             total_url_raw_score,

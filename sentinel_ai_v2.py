@@ -35,6 +35,12 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(ROOT_DIR, "sentinelai.db")
 CREDENTIALS_PATH = os.path.join(ROOT_DIR, "config", "credentials.json")
 TOKEN_PATH = os.path.join(ROOT_DIR, "config", "token.pickle")
+MODEL_PATH = os.path.join(ROOT_DIR, "model.pkl")
+
+# ML probability bands: predict_proba >= HIGH → HIGH RISK,
+# >= MEDIUM → MEDIUM RISK, otherwise LOW RISK.
+RISK_HIGH_THRESHOLD = 0.70
+RISK_MEDIUM_THRESHOLD = 0.30
 
 
 TRUSTED_DOMAINS = [
@@ -652,7 +658,28 @@ def urgency_heuristic_score(features):
 # FINAL RISK ENGINE
 # --------------------------------------------------
 
-def calculate_risk(url_score_raw, sender_score_raw, urgency_risk):
+def _load_risk_model():
+    """Load the trained model saved by train_model.py, or None if absent."""
+    if not os.path.exists(MODEL_PATH):
+        return None
+
+    try:
+        with open(MODEL_PATH, "rb") as model_file:
+            payload = pickle.load(model_file)
+
+        return payload
+
+    except Exception as error:
+        print(f"Warning: could not load {MODEL_PATH} ({error}); "
+              f"falling back to heuristic scoring.")
+        return None
+
+
+RISK_MODEL = _load_risk_model()
+
+
+def _heuristic_risk(url_score_raw, sender_score_raw, urgency_risk):
+    """Original additive-weight scoring, kept as the no-model fallback."""
     url_risk = min(url_score_raw / 2, 35)
     sender_risk = min(sender_score_raw / 3, 25)
 
@@ -666,6 +693,48 @@ def calculate_risk(url_score_raw, sender_score_raw, urgency_risk):
         level = "LOW RISK"
 
     return final_score, level, round(url_risk), round(sender_risk)
+
+
+def calculate_risk(url_score_raw, sender_score_raw, urgency_risk,
+                   features=None):
+    """Compute (final_score, level, url_risk, sender_risk) for an email.
+
+    When a trained model (model.pkl) is available and a feature vector is
+    provided, risk comes from model.predict_proba() mapped to bands via
+    RISK_HIGH_THRESHOLD / RISK_MEDIUM_THRESHOLD. Otherwise the original
+    heuristic scoring is used, so the scanner runs without a trained model.
+
+    The first three arguments and the return shape are unchanged for
+    backward compatibility.
+    """
+    heuristic = _heuristic_risk(url_score_raw, sender_score_raw, urgency_risk)
+
+    if RISK_MODEL is None or features is None:
+        return heuristic
+
+    try:
+        feature_row = [
+            [float(features[name]) for name in RISK_MODEL["feature_names"]]
+        ]
+        probability = RISK_MODEL["model"].predict_proba(feature_row)[0][1]
+
+    except Exception as error:
+        print(f"Warning: model prediction failed ({error}); "
+              f"using heuristic scoring.")
+        return heuristic
+
+    final_score = round(probability * 100)
+
+    if probability >= RISK_HIGH_THRESHOLD:
+        level = "HIGH RISK"
+    elif probability >= RISK_MEDIUM_THRESHOLD:
+        level = "MEDIUM RISK"
+    else:
+        level = "LOW RISK"
+
+    # url_risk / sender_risk sub-scores remain heuristic-derived for
+    # display and DB compatibility.
+    return final_score, level, heuristic[2], heuristic[3]
 
 
 # --------------------------------------------------
@@ -860,10 +929,26 @@ def run_scanner():
         sender_raw_score = sender_heuristic_score(sender_features)
         urgency_risk = urgency_heuristic_score(urgency_features)
 
+        features = None
+
+        if RISK_MODEL is not None:
+            try:
+                # Imported lazily: feature_vector depends on this module.
+                from feature_vector import build_feature_vector
+
+                features = build_feature_vector(
+                    sender, subject, body, headers=headers
+                )
+
+            except Exception as error:
+                print(f"Warning: feature extraction failed ({error}); "
+                      f"using heuristic scoring.")
+
         final_score, risk_level, url_risk, sender_risk = calculate_risk(
             total_url_raw_score,
             sender_raw_score,
-            urgency_risk
+            urgency_risk,
+            features=features,
         )
 
         clean_reasons = list(dict.fromkeys(all_reasons))

@@ -1,0 +1,27 @@
+# SentinelAI dependencies
+
+# API + dashboards
+fastapi
+uvicorn[standard]
+streamlit
+
+# Gmail integration
+google-auth
+google-auth-oauthlib
+google-api-python-client
+
+# Feature extraction
+tldextract
+python-Levenshtein
+
+# ML risk engine
+lightgbm
+scikit-learn
+pandas
+
+# BERT spam classifier
+transformers
+torch
+
+# Testing
+pytest

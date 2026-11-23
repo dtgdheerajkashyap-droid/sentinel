@@ -1,0 +1,22 @@
+# Pinned environment for `python eval/run_all.py` (versions of the run in reports/results.md).
+# Python 3.11. torch is the CPU build:
+#   pip install -r requirements-eval.txt --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.3.1
+transformers==4.41.2
+tokenizers==0.19.1
+safetensors==0.4.3
+huggingface-hub==0.23.3
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.0
+scipy==1.13.1
+matplotlib==3.9.2
+tldextract==5.1.2
+requests==2.32.2
+requests-file==3.0.1
+filelock==3.29.3
+idna==3.18
+# imported (never called) by sentinel_ai_v2.py at module load
+google-auth==2.56.2
+google-auth-oauthlib==1.2.0
+google-api-python-client==2.131.0

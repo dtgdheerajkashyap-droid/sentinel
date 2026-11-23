@@ -185,7 +185,11 @@ def get_gmail_service():
             creds = pickle.load(token_file)
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except Exception:
+            # Token expired or revoked - force full re-authentication
+            creds = None
 
     if not creds or not creds.valid:
         flow = InstalledAppFlow.from_client_secrets_file(
@@ -236,7 +240,12 @@ def clean_url(url):
     url = url.strip()
     url = url.rstrip(".,);]'\"")
 
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # Malformed URL (e.g. stray brackets parsed as IPv6) — return as-is.
+        return url
+
     query_params = parse_qs(parsed.query)
 
     redirect_keys = [
